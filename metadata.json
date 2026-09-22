@@ -1,0 +1,6 @@
+{
+  "name": "Kühlschrank Rezepte",
+  "description": "Verwalte deine Zutaten im digitalen Kühlschrank, finde passende Rezepte, koche Gerichte mit automatischer Zutaten-Entnahme und plane Einkäufe.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
