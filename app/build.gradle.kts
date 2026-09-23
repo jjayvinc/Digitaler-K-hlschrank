@@ -21,6 +21,9 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    val envGeminiKey = System.getenv("GEMINI_API_KEY") ?: ""
+    buildConfigField("String", "BUILTIN_GEMINI_KEY", "\"$envGeminiKey\"")
   }
 
   signingConfigs {
@@ -65,6 +68,14 @@ android {
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
 // to match the convention used in Web projects.
+val rootEnvFile = rootProject.file(".env")
+val sysGeminiKey = System.getenv("GEMINI_API_KEY") ?: ""
+if (sysGeminiKey.isNotBlank()) {
+  if (!rootEnvFile.exists() || !rootEnvFile.readText().contains("GEMINI_API_KEY=")) {
+    rootEnvFile.writeText("GEMINI_API_KEY=$sysGeminiKey\n")
+  }
+}
+
 secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"

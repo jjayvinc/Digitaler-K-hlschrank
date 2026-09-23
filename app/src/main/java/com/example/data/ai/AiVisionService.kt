@@ -23,7 +23,7 @@ enum class ScanType {
 }
 
 enum class AiProvider(val id: String, val displayName: String, val badge: String, val description: String) {
-    GEMINI("gemini", "Google Gemini 2.5 Flash", "✨", "Echtzeit-Fotoanalyse für Kühlschrank & Kassenbon (Empfohlen)"),
+    GEMINI("gemini", "Google Gemini 3.6 Flash", "✨", "Echtzeit-Fotoanalyse für Kühlschrank & Kassenbon (Bereit & kostenlos)"),
     OPENAI("openai", "OpenAI Vision (GPT-4o mini)", "⚡", "Optionale Analyse mit eigenem OpenAI API-Schlüssel"),
     ANTHROPIC("anthropic", "Anthropic Claude Vision", "🌟", "Optionale Analyse mit eigenem Claude API-Schlüssel")
 }
@@ -75,7 +75,7 @@ class AiVisionService(private val context: Context) {
         set(value) = prefs.edit().putString("anthropic_api_key", value.trim()).apply()
 
     /**
-     * Resolves the active Gemini API key from custom settings or BuildConfig.
+     * Resolves the active Gemini API key from custom settings, BuildConfig secrets, or builtin env.
      */
     fun getEffectiveGeminiKey(): String? {
         if (geminiCustomKey.isNotBlank()) {
@@ -89,6 +89,15 @@ class AiVisionService(private val context: Context) {
         }
         if (!buildConfigKey.isNullOrBlank() && buildConfigKey != "MY_GEMINI_API_KEY") {
             return buildConfigKey
+        }
+        val builtinKey = try {
+            val field = BuildConfig::class.java.getField("BUILTIN_GEMINI_KEY")
+            field.get(null) as? String
+        } catch (_: Exception) {
+            null
+        }
+        if (!builtinKey.isNullOrBlank() && builtinKey != "MY_GEMINI_API_KEY") {
+            return builtinKey
         }
         return null
     }
@@ -109,7 +118,7 @@ class AiVisionService(private val context: Context) {
                 val key = getEffectiveGeminiKey()
                 if (key.isNullOrBlank()) {
                     throw IllegalStateException(
-                        "Kein Gemini API-Schlüssel hinterlegt. Bitte öffne die ⚙️ Scan-Einstellungen und trage deinen kostenlosen Google Gemini API-Schlüssel ein."
+                        "Kein Gemini API-Schlüssel gefunden. Bitte stelle sicher, dass der API-Schlüssel in der Build-Umgebung konfiguriert ist oder trage deinen Key in den ⚙️ Einstellungen ein."
                     )
                 }
                 scanWithGemini(base64Image, scanType, key)
@@ -134,7 +143,8 @@ class AiVisionService(private val context: Context) {
     }
 
     /**
-     * Real Google Gemini Vision API call (gemini-2.5-flash)
+     * Real Google Gemini Vision API call with model fallback:
+     * Tries gemini-3.6-flash first, falls back to gemini-3.5-flash or gemini-flash-latest.
      */
     private suspend fun scanWithGemini(
         base64Image: String,
@@ -165,46 +175,53 @@ class AiVisionService(private val context: Context) {
             })
         }
 
-        val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
-            .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
-            .build()
+        val modelsToTry = listOf("gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest")
+        var lastError: String? = null
+        var lastStatusCode = 0
 
-        val response = httpClient.newCall(request).execute()
-        val responseBody = response.body?.string().orEmpty()
+        for (model in modelsToTry) {
+            val request = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
+                .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
+                .build()
 
-        if (!response.isSuccessful) {
-            val errorDetail = try {
-                val errJson = JSONObject(responseBody)
-                errJson.optJSONObject("error")?.optString("message") ?: responseBody
-            } catch (_: Exception) {
-                responseBody
+            val response = httpClient.newCall(request).execute()
+            val responseBody = response.body?.string().orEmpty()
+
+            if (response.isSuccessful) {
+                val json = JSONObject(responseBody)
+                val candidates = json.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val text = candidates.getJSONObject(0)
+                        .getJSONObject("content")
+                        .getJSONArray("parts")
+                        .getJSONObject(0)
+                        .getString("text")
+
+                    val items = parseJsonIngredients(text, scanType)
+                    return ScanResult(
+                        ingredients = items,
+                        scanType = scanType,
+                        providerName = "Google Gemini ($model)"
+                    )
+                }
+            } else {
+                lastStatusCode = response.code
+                val errorDetail = try {
+                    val errJson = JSONObject(responseBody)
+                    errJson.optJSONObject("error")?.optString("message") ?: responseBody
+                } catch (_: Exception) {
+                    responseBody
+                }
+                lastError = errorDetail
+                // If 404 (model not found), try next fallback model
+                if (response.code != 404) {
+                    break
+                }
             }
-            throw IllegalStateException("Gemini API Fehler (${response.code}): $errorDetail")
         }
 
-        val json = JSONObject(responseBody)
-        val candidates = json.optJSONArray("candidates")
-        if (candidates == null || candidates.length() == 0) {
-            throw IllegalStateException("Gemini hat keine Antwort zurückgegeben. Bitte probiere es erneut.")
-        }
-
-        val text = candidates.getJSONObject(0)
-            .getJSONObject("content")
-            .getJSONArray("parts")
-            .getJSONObject(0)
-            .getString("text")
-
-        val items = parseJsonIngredients(text, scanType)
-        if (items.isEmpty()) {
-            throw IllegalStateException("Auf dem Foto wurden keine Lebensmittel erkannt. Bitte achte auf gute Beleuchtung und einen scharfen Blickwinkel.")
-        }
-
-        return ScanResult(
-            ingredients = items,
-            scanType = scanType,
-            providerName = "Google Gemini 2.5 Flash"
-        )
+        throw IllegalStateException("Gemini API Fehler ($lastStatusCode): ${lastError ?: "Unbekannter Fehler"}")
     }
 
     /**

@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,7 +65,18 @@ fun AiProviderSettingsDialog(
     var showOpenAiKey by remember { mutableStateOf(false) }
     var showAnthropicKey by remember { mutableStateOf(false) }
 
-    val hasSystemGeminiKey = remember { aiService.getEffectiveGeminiKey() != null }
+    val hasSystemGeminiKey = remember {
+        val buildConfigKey = try {
+            val field = com.example.BuildConfig::class.java.getField("GEMINI_API_KEY")
+            field.get(null) as? String
+        } catch (_: Exception) { null }
+        val builtinKey = try {
+            val field = com.example.BuildConfig::class.java.getField("BUILTIN_GEMINI_KEY")
+            field.get(null) as? String
+        } catch (_: Exception) { null }
+        (!buildConfigKey.isNullOrBlank() && buildConfigKey != "MY_GEMINI_API_KEY") ||
+        (!builtinKey.isNullOrBlank() && builtinKey != "MY_GEMINI_API_KEY")
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -119,26 +131,48 @@ fun AiProviderSettingsDialog(
                 )
 
                 if (selectedProvider == AiProvider.GEMINI) {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        if (hasSystemGeminiKey && geminiKey.isBlank()) {
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
-                                modifier = Modifier.fillMaxWidth()
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
                                     Text("✓", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                                     Text(
-                                        text = "Google Gemini System-Schlüssel ist aktiv",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Medium,
+                                        text = "Google Gemini 3.6 Flash ist aktiv",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.onPrimaryContainer
                                     )
                                 }
+                                Text(
+                                    text = "Bereit & einsatzbereit! Du musst keinen eigenen Schlüssel eintragen – die KI scannt Fotos direkt.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                                )
+                            }
+                        }
+
+                        if (geminiKey.isNotBlank()) {
+                            OutlinedButton(
+                                onClick = {
+                                    geminiKey = ""
+                                    aiService.geminiCustomKey = ""
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Icon(Icons.Default.Clear, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Eigenen Key löschen & Standard nutzen")
                             }
                         }
 
@@ -146,7 +180,7 @@ fun AiProviderSettingsDialog(
                             value = geminiKey,
                             onValueChange = { geminiKey = it },
                             label = { Text("Eigener Gemini API-Key (optional)") },
-                            placeholder = { Text("AIzaSy...") },
+                            placeholder = { Text("Standard-Schlüssel aktiv") },
                             singleLine = true,
                             leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
                             trailingIcon = {
@@ -161,11 +195,6 @@ fun AiProviderSettingsDialog(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .testTag("gemini_api_key_input")
-                        )
-                        Text(
-                            text = "Kostenlos erhältlich auf aistudio.google.com/app/apikey. Damit analysiert die KI jedes deiner Fotos in Echtzeit.",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
                 }
