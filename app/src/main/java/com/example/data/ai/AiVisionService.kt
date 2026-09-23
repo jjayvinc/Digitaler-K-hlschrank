@@ -214,14 +214,20 @@ class AiVisionService(private val context: Context) {
                     responseBody
                 }
                 lastError = errorDetail
-                // If 404 (model not found), try next fallback model
-                if (response.code != 404) {
+                // If 404 (model not found) or 503, try next fallback model
+                if (response.code != 404 && response.code != 503) {
                     break
                 }
             }
         }
 
-        throw IllegalStateException("Gemini API Fehler ($lastStatusCode): ${lastError ?: "Unbekannter Fehler"}")
+        val friendlyMessage = when (lastStatusCode) {
+            429 -> "Das Anfrage-Limit des KI-Servers ist momentan erreicht. Bitte warte eine Minute oder trage in den ⚙️ Einstellungen deinen eigenen kostenlosen Gemini-Key ein."
+            401, 403 -> "API-Zugriff verweigert ($lastStatusCode). Bitte prüfe deinen Schlüssel in den ⚙️ Einstellungen oder klicke auf 'Standard nutzen'."
+            404 -> "Das KI-Modell ist temporär nicht erreichbar (404). Bitte versuche es in wenigen Augenblicken erneut."
+            else -> "Gemini API Fehler ($lastStatusCode): ${lastError ?: "Unbekannter Fehler"}"
+        }
+        throw IllegalStateException(friendlyMessage)
     }
 
     /**

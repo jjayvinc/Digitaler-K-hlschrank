@@ -18,4 +18,13 @@ class ExampleRobolectricTest {
     val appName = context.getString(R.string.app_name)
     assertEquals("Kühlschrank Rezepte", appName)
   }
+
+  @Test
+  fun `check effective gemini key`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val service = com.example.data.ai.AiVisionService(context)
+    val key = service.getEffectiveGeminiKey()
+    org.junit.Assert.assertNotNull("Key should not be null", key)
+    org.junit.Assert.assertTrue("Key should not be empty", key!!.isNotBlank())
+  }
 }
