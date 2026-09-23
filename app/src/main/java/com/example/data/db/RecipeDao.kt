@@ -65,6 +65,13 @@ interface RecipeDao {
         return recipeId
     }
 
+    @Transaction
+    suspend fun insertRecipesWithIngredientsBatch(items: List<Pair<Recipe, List<RecipeIngredient>>>) {
+        for ((recipe, ingredients) in items) {
+            insertRecipeWithIngredients(recipe, ingredients)
+        }
+    }
+
     @Delete
     suspend fun deleteRecipe(recipe: Recipe)
 

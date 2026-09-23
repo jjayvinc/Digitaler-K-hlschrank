@@ -5,6 +5,7 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.data.model.CatalogIngredientEntity
 import com.example.data.model.CookingRecord
 import com.example.data.model.FridgeItem
 import com.example.data.model.Recipe
@@ -21,15 +22,17 @@ import kotlinx.coroutines.launch
         Recipe::class,
         RecipeIngredient::class,
         ShoppingItem::class,
-        CookingRecord::class
+        CookingRecord::class,
+        CatalogIngredientEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun fridgeDao(): FridgeDao
     abstract fun recipeDao(): RecipeDao
     abstract fun shoppingDao(): ShoppingDao
+    abstract fun catalogDao(): CatalogDao
 
     companion object {
         @Volatile

@@ -57,10 +57,14 @@ fun AiProviderSettingsDialog(
     onSaved: () -> Unit
 ) {
     var selectedProvider by remember { mutableStateOf(aiService.activeProvider) }
+    var geminiKey by remember { mutableStateOf(aiService.geminiCustomKey) }
     var openAiKey by remember { mutableStateOf(aiService.openAiKey) }
     var anthropicKey by remember { mutableStateOf(aiService.anthropicKey) }
+    var showGeminiKey by remember { mutableStateOf(false) }
     var showOpenAiKey by remember { mutableStateOf(false) }
     var showAnthropicKey by remember { mutableStateOf(false) }
+
+    val hasSystemGeminiKey = remember { aiService.getEffectiveGeminiKey() != null }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -84,7 +88,7 @@ fun AiProviderSettingsDialog(
                         Text("⚙️", fontSize = 20.sp)
                     }
                     Text(
-                        text = "Scan-Einstellungen",
+                        text = "Scan-Einstellungen & KI",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -102,17 +106,69 @@ fun AiProviderSettingsDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    text = "Wähle deine bevorzugte Erkennungsmethode für Fotos und Einkaufsbons:",
+                    text = "Wähle das KI-Modell für deine echte Foto- und Kassenbon-Erkennung:",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                // Option 1: Free Default
+                // Option 1: Google Gemini (Recommended)
                 ProviderCard(
-                    provider = AiProvider.FREE_DEFAULT,
-                    isSelected = selectedProvider == AiProvider.FREE_DEFAULT,
-                    onClick = { selectedProvider = AiProvider.FREE_DEFAULT }
+                    provider = AiProvider.GEMINI,
+                    isSelected = selectedProvider == AiProvider.GEMINI,
+                    onClick = { selectedProvider = AiProvider.GEMINI }
                 )
+
+                if (selectedProvider == AiProvider.GEMINI) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        if (hasSystemGeminiKey && geminiKey.isBlank()) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text("✓", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        text = "Google Gemini System-Schlüssel ist aktiv",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                }
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = geminiKey,
+                            onValueChange = { geminiKey = it },
+                            label = { Text("Eigener Gemini API-Key (optional)") },
+                            placeholder = { Text("AIzaSy...") },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
+                            trailingIcon = {
+                                IconButton(onClick = { showGeminiKey = !showGeminiKey }) {
+                                    Icon(
+                                        if (showGeminiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = null
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showGeminiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("gemini_api_key_input")
+                        )
+                        Text(
+                            text = "Kostenlos erhältlich auf aistudio.google.com/app/apikey. Damit analysiert die KI jedes deiner Fotos in Echtzeit.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
 
                 // Option 2: OpenAI
                 ProviderCard(
@@ -122,31 +178,33 @@ fun AiProviderSettingsDialog(
                 )
 
                 if (selectedProvider == AiProvider.OPENAI) {
-                    OutlinedTextField(
-                        value = openAiKey,
-                        onValueChange = { openAiKey = it },
-                        label = { Text("OpenAI API-Key (sk-...)") },
-                        placeholder = { Text("sk-proj-...") },
-                        singleLine = true,
-                        leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
-                        trailingIcon = {
-                            IconButton(onClick = { showOpenAiKey = !showOpenAiKey }) {
-                                Icon(
-                                    if (showOpenAiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = null
-                                )
-                            }
-                        },
-                        visualTransformation = if (showOpenAiKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("openai_api_key_input")
-                    )
-                    Text(
-                        text = "Wird für GPT-4o mini Vision genutzt. Bleibt sicher auf deinem Gerät.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedTextField(
+                            value = openAiKey,
+                            onValueChange = { openAiKey = it },
+                            label = { Text("OpenAI API-Key (sk-...)") },
+                            placeholder = { Text("sk-proj-...") },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
+                            trailingIcon = {
+                                IconButton(onClick = { showOpenAiKey = !showOpenAiKey }) {
+                                    Icon(
+                                        if (showOpenAiKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = null
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showOpenAiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("openai_api_key_input")
+                        )
+                        Text(
+                            text = "Wird für GPT-4o mini Vision genutzt. Bleibt sicher auf deinem Gerät.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 // Option 3: Anthropic
@@ -157,31 +215,33 @@ fun AiProviderSettingsDialog(
                 )
 
                 if (selectedProvider == AiProvider.ANTHROPIC) {
-                    OutlinedTextField(
-                        value = anthropicKey,
-                        onValueChange = { anthropicKey = it },
-                        label = { Text("Anthropic API-Key (sk-ant-...)") },
-                        placeholder = { Text("sk-ant-api03-...") },
-                        singleLine = true,
-                        leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
-                        trailingIcon = {
-                            IconButton(onClick = { showAnthropicKey = !showAnthropicKey }) {
-                                Icon(
-                                    if (showAnthropicKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = null
-                                )
-                            }
-                        },
-                        visualTransformation = if (showAnthropicKey) VisualTransformation.None else PasswordVisualTransformation(),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("anthropic_api_key_input")
-                    )
-                    Text(
-                        text = "Wird für Claude 3.5 Vision genutzt. Bleibt sicher auf deinem Gerät.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedTextField(
+                            value = anthropicKey,
+                            onValueChange = { anthropicKey = it },
+                            label = { Text("Anthropic API-Key (sk-ant-...)") },
+                            placeholder = { Text("sk-ant-api03-...") },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
+                            trailingIcon = {
+                                IconButton(onClick = { showAnthropicKey = !showAnthropicKey }) {
+                                    Icon(
+                                        if (showAnthropicKey) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = null
+                                    )
+                                }
+                            },
+                            visualTransformation = if (showAnthropicKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("anthropic_api_key_input")
+                        )
+                        Text(
+                            text = "Wird für Claude 3.5 Vision genutzt. Bleibt sicher auf deinem Gerät.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         },
@@ -189,6 +249,7 @@ fun AiProviderSettingsDialog(
             Button(
                 onClick = {
                     aiService.activeProvider = selectedProvider
+                    aiService.geminiCustomKey = geminiKey
                     aiService.openAiKey = openAiKey
                     aiService.anthropicKey = anthropicKey
                     onSaved()

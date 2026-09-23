@@ -38,6 +38,7 @@ fun IngredientDatabaseDialog(
     onDismiss: () -> Unit,
     onAddIngredient: (ScannedIngredient) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     var searchQuery by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("Alle") }
     val addedIngredientNames = remember { mutableStateListOf<String>() }
@@ -200,6 +201,19 @@ fun IngredientDatabaseDialog(
                                     .clickable {
                                         val customName = searchQuery.trim().replaceFirstChar { it.uppercase() }
                                         val customCategory = if (selectedCategory != "Alle") selectedCategory else "Vorrat & Teigwaren"
+                                        IngredientCatalog.registerIngredient(
+                                            name = customName,
+                                            category = customCategory,
+                                            amount = 1.0,
+                                            unit = "Stück"
+                                        )
+                                        com.example.data.cloud.FirestoreIngredientSync.publishIngredient(
+                                            context = context,
+                                            name = customName,
+                                            category = customCategory,
+                                            amount = 1.0,
+                                            unit = "Stück"
+                                        )
                                         val newIng = ScannedIngredient(
                                             name = customName,
                                             amount = 1.0,

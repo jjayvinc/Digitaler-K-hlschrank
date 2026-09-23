@@ -6,7 +6,6 @@ import android.util.Base64
 import android.util.Log
 import com.example.BuildConfig
 import com.example.data.repository.FridgeRecipeRepository
-import com.example.ui.components.IngredientCatalog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -24,9 +23,9 @@ enum class ScanType {
 }
 
 enum class AiProvider(val id: String, val displayName: String, val badge: String, val description: String) {
-    FREE_DEFAULT("free", "Standard-Erkennung", "✨", "Direkt startklar – schnell, privat und ohne Einrichtung"),
-    OPENAI("openai", "Erweiterte Bon-Erkennung", "⚡", "Optionale erweiterte Bon-Analyse mit eigenem API-Schlüssel"),
-    ANTHROPIC("anthropic", "Erweiterte Foto-Erkennung", "🌟", "Optionale erweiterte Bild-Analyse mit eigenem API-Schlüssel")
+    GEMINI("gemini", "Google Gemini 2.5 Flash", "✨", "Echtzeit-Fotoanalyse für Kühlschrank & Kassenbon (Empfohlen)"),
+    OPENAI("openai", "OpenAI Vision (GPT-4o mini)", "⚡", "Optionale Analyse mit eigenem OpenAI API-Schlüssel"),
+    ANTHROPIC("anthropic", "Anthropic Claude Vision", "🌟", "Optionale Analyse mit eigenem Claude API-Schlüssel")
 }
 
 data class ScannedIngredient(
@@ -49,19 +48,23 @@ class AiVisionService(private val context: Context) {
     private val prefs = context.getSharedPreferences("ai_vision_settings", Context.MODE_PRIVATE)
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     var activeProvider: AiProvider
         get() {
-            val saved = prefs.getString("active_provider", AiProvider.FREE_DEFAULT.id)
-            return AiProvider.entries.firstOrNull { it.id == saved } ?: AiProvider.FREE_DEFAULT
+            val saved = prefs.getString("active_provider", AiProvider.GEMINI.id)
+            return AiProvider.entries.firstOrNull { it.id == saved } ?: AiProvider.GEMINI
         }
         set(value) {
             prefs.edit().putString("active_provider", value.id).apply()
         }
+
+    var geminiCustomKey: String
+        get() = prefs.getString("gemini_api_key", "").orEmpty()
+        set(value) = prefs.edit().putString("gemini_api_key", value.trim()).apply()
 
     var openAiKey: String
         get() = prefs.getString("openai_api_key", "").orEmpty()
@@ -72,7 +75,27 @@ class AiVisionService(private val context: Context) {
         set(value) = prefs.edit().putString("anthropic_api_key", value.trim()).apply()
 
     /**
-     * Scans an image with the selected or best available AI Provider.
+     * Resolves the active Gemini API key from custom settings or BuildConfig.
+     */
+    fun getEffectiveGeminiKey(): String? {
+        if (geminiCustomKey.isNotBlank()) {
+            return geminiCustomKey
+        }
+        val buildConfigKey = try {
+            val field = BuildConfig::class.java.getField("GEMINI_API_KEY")
+            field.get(null) as? String
+        } catch (_: Exception) {
+            null
+        }
+        if (!buildConfigKey.isNullOrBlank() && buildConfigKey != "MY_GEMINI_API_KEY") {
+            return buildConfigKey
+        }
+        return null
+    }
+
+    /**
+     * Scans an image with the selected AI Provider.
+     * Throws clear exceptions if keys are missing or API fails, so the user knows what happened.
      */
     suspend fun scanImage(
         bitmap: Bitmap,
@@ -81,32 +104,107 @@ class AiVisionService(private val context: Context) {
         val provider = activeProvider
         val base64Image = bitmapToBase64(bitmap)
 
-        try {
-            when (provider) {
-                AiProvider.OPENAI -> {
-                    if (openAiKey.isNotBlank()) {
-                        scanWithOpenAi(base64Image, scanType, openAiKey)
-                    } else {
-                        // Fallback to free if key not configured
-                        scanWithFreeVision(base64Image, scanType, fallbackReason = "Standard-Erkennung verwendet")
-                    }
+        when (provider) {
+            AiProvider.GEMINI -> {
+                val key = getEffectiveGeminiKey()
+                if (key.isNullOrBlank()) {
+                    throw IllegalStateException(
+                        "Kein Gemini API-Schlüssel hinterlegt. Bitte öffne die ⚙️ Scan-Einstellungen und trage deinen kostenlosen Google Gemini API-Schlüssel ein."
+                    )
                 }
-                AiProvider.ANTHROPIC -> {
-                    if (anthropicKey.isNotBlank()) {
-                        scanWithAnthropic(base64Image, scanType, anthropicKey)
-                    } else {
-                        // Fallback to free if key not configured
-                        scanWithFreeVision(base64Image, scanType, fallbackReason = "Standard-Erkennung verwendet")
-                    }
-                }
-                AiProvider.FREE_DEFAULT -> {
-                    scanWithFreeVision(base64Image, scanType)
-                }
+                scanWithGemini(base64Image, scanType, key)
             }
-        } catch (e: Exception) {
-            Log.e("AiVisionService", "Scan failed with provider $provider, using smart fallback", e)
-            generateSmartFallback(scanType, "Scan erfolgreich")
+            AiProvider.OPENAI -> {
+                if (openAiKey.isBlank()) {
+                    throw IllegalStateException(
+                        "Kein OpenAI API-Schlüssel hinterlegt. Bitte trage deinen Key in den ⚙️ Scan-Einstellungen ein oder wähle Google Gemini."
+                    )
+                }
+                scanWithOpenAi(base64Image, scanType, openAiKey)
+            }
+            AiProvider.ANTHROPIC -> {
+                if (anthropicKey.isBlank()) {
+                    throw IllegalStateException(
+                        "Kein Anthropic API-Schlüssel hinterlegt. Bitte trage deinen Key in den ⚙️ Scan-Einstellungen ein oder wähle Google Gemini."
+                    )
+                }
+                scanWithAnthropic(base64Image, scanType, anthropicKey)
+            }
         }
+    }
+
+    /**
+     * Real Google Gemini Vision API call (gemini-2.5-flash)
+     */
+    private suspend fun scanWithGemini(
+        base64Image: String,
+        scanType: ScanType,
+        apiKey: String
+    ): ScanResult {
+        val prompt = buildPrompt(scanType)
+        val geminiPayload = JSONObject().apply {
+            val contents = JSONArray().apply {
+                val item = JSONObject().apply {
+                    val parts = JSONArray().apply {
+                        put(JSONObject().apply { put("text", prompt) })
+                        put(JSONObject().apply {
+                            put("inlineData", JSONObject().apply {
+                                put("mimeType", "image/jpeg")
+                                put("data", base64Image)
+                            })
+                        })
+                    }
+                    put("parts", parts)
+                }
+                put(item)
+            }
+            put("contents", contents)
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.1)
+                put("maxOutputTokens", 1200)
+            })
+        }
+
+        val request = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey")
+            .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val response = httpClient.newCall(request).execute()
+        val responseBody = response.body?.string().orEmpty()
+
+        if (!response.isSuccessful) {
+            val errorDetail = try {
+                val errJson = JSONObject(responseBody)
+                errJson.optJSONObject("error")?.optString("message") ?: responseBody
+            } catch (_: Exception) {
+                responseBody
+            }
+            throw IllegalStateException("Gemini API Fehler (${response.code}): $errorDetail")
+        }
+
+        val json = JSONObject(responseBody)
+        val candidates = json.optJSONArray("candidates")
+        if (candidates == null || candidates.length() == 0) {
+            throw IllegalStateException("Gemini hat keine Antwort zurückgegeben. Bitte probiere es erneut.")
+        }
+
+        val text = candidates.getJSONObject(0)
+            .getJSONObject("content")
+            .getJSONArray("parts")
+            .getJSONObject(0)
+            .getString("text")
+
+        val items = parseJsonIngredients(text, scanType)
+        if (items.isEmpty()) {
+            throw IllegalStateException("Auf dem Foto wurden keine Lebensmittel erkannt. Bitte achte auf gute Beleuchtung und einen scharfen Blickwinkel.")
+        }
+
+        return ScanResult(
+            ingredients = items,
+            scanType = scanType,
+            providerName = "Google Gemini 2.5 Flash"
+        )
     }
 
     /**
@@ -120,8 +218,8 @@ class AiVisionService(private val context: Context) {
         val prompt = buildPrompt(scanType)
         val jsonPayload = JSONObject().apply {
             put("model", "gpt-4o-mini")
-            put("temperature", 0.2)
-            put("max_tokens", 800)
+            put("temperature", 0.1)
+            put("max_tokens", 1000)
             val messagesArray = JSONArray().apply {
                 val userMsg = JSONObject().apply {
                     put("role", "user")
@@ -155,7 +253,13 @@ class AiVisionService(private val context: Context) {
         val responseBody = response.body?.string().orEmpty()
 
         if (!response.isSuccessful) {
-            throw IllegalStateException("OpenAI HTTP ${response.code}: $responseBody")
+            val errorDetail = try {
+                val errJson = JSONObject(responseBody)
+                errJson.optJSONObject("error")?.optString("message") ?: responseBody
+            } catch (_: Exception) {
+                responseBody
+            }
+            throw IllegalStateException("OpenAI Fehler (${response.code}): $errorDetail")
         }
 
         val parsedJson = JSONObject(responseBody)
@@ -165,6 +269,10 @@ class AiVisionService(private val context: Context) {
             .getString("content")
 
         val ingredients = parseJsonIngredients(textResponse, scanType)
+        if (ingredients.isEmpty()) {
+            throw IllegalStateException("Auf dem Foto wurden keine Lebensmittel erkannt.")
+        }
+
         return ScanResult(
             ingredients = ingredients,
             scanType = scanType,
@@ -173,7 +281,7 @@ class AiVisionService(private val context: Context) {
     }
 
     /**
-     * Anthropic Claude Vision API call (Claude 3.5 Haiku / Sonnet)
+     * Anthropic Claude Vision API call (Claude 3.5 Haiku)
      */
     private suspend fun scanWithAnthropic(
         base64Image: String,
@@ -220,7 +328,13 @@ class AiVisionService(private val context: Context) {
         val responseBody = response.body?.string().orEmpty()
 
         if (!response.isSuccessful) {
-            throw IllegalStateException("Anthropic HTTP ${response.code}: $responseBody")
+            val errorDetail = try {
+                val errJson = JSONObject(responseBody)
+                errJson.optJSONObject("error")?.optString("message") ?: responseBody
+            } catch (_: Exception) {
+                responseBody
+            }
+            throw IllegalStateException("Anthropic Fehler (${response.code}): $errorDetail")
         }
 
         val parsedJson = JSONObject(responseBody)
@@ -228,6 +342,10 @@ class AiVisionService(private val context: Context) {
         val textResponse = contentArray.getJSONObject(0).getString("text")
 
         val ingredients = parseJsonIngredients(textResponse, scanType)
+        if (ingredients.isEmpty()) {
+            throw IllegalStateException("Auf dem Foto wurden keine Lebensmittel erkannt.")
+        }
+
         return ScanResult(
             ingredients = ingredients,
             scanType = scanType,
@@ -235,94 +353,25 @@ class AiVisionService(private val context: Context) {
         )
     }
 
-    /**
-     * Free Built-in Vision Provider (Gemini / AI Studio or intelligent visual processor)
-     */
-    private suspend fun scanWithFreeVision(
-        base64Image: String,
-        scanType: ScanType,
-        fallbackReason: String? = null
-    ): ScanResult {
-        // Try Gemini REST if GEMINI_API_KEY is configured via BuildConfig or environment
-        val geminiKey = try {
-            val field = BuildConfig::class.java.getField("GEMINI_API_KEY")
-            field.get(null) as? String
-        } catch (_: Exception) {
-            null
-        }
-
-        if (!geminiKey.isNullOrBlank() && geminiKey != "MY_GEMINI_API_KEY") {
-            try {
-                val prompt = buildPrompt(scanType)
-                val geminiPayload = JSONObject().apply {
-                    val contents = JSONArray().apply {
-                        val item = JSONObject().apply {
-                            val parts = JSONArray().apply {
-                                put(JSONObject().apply { put("text", prompt) })
-                                put(JSONObject().apply {
-                                    put("inlineData", JSONObject().apply {
-                                        put("mimeType", "image/jpeg")
-                                        put("data", base64Image)
-                                    })
-                                })
-                            }
-                            put("parts", parts)
-                        }
-                        put(item)
-                    }
-                    put("contents", contents)
-                }
-
-                val request = Request.Builder()
-                    .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$geminiKey")
-                    .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-
-                val response = httpClient.newCall(request).execute()
-                val body = response.body?.string().orEmpty()
-                if (response.isSuccessful) {
-                    val json = JSONObject(body)
-                    val text = json.getJSONArray("candidates")
-                        .getJSONObject(0)
-                        .getJSONObject("content")
-                        .getJSONArray("parts")
-                        .getJSONObject(0)
-                        .getString("text")
-                    val items = parseJsonIngredients(text, scanType)
-                    if (items.isNotEmpty()) {
-                        return ScanResult(
-                            ingredients = items,
-                            scanType = scanType,
-                            providerName = "Foto-Scan",
-                            note = fallbackReason
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w("AiVisionService", "Gemini call failed, continuing to smart detection", e)
-            }
-        }
-
-        // Return smart recognized items based on scan type
-        return generateSmartFallback(scanType, fallbackReason ?: "Erfolgreich erkannt")
-    }
-
     private fun buildPrompt(scanType: ScanType): String {
         return when (scanType) {
             ScanType.FRIDGE ->
-                "Du bist ein Küchen- und Lebensmittel-Experte. Analysiere dieses Foto eines Kühlschranks. " +
-                        "Erkenne alle sichtbaren Lebensmittel, Flaschen, Gemüse, Milchprodukte, Fleischwaren und Reste. " +
-                        "Antworte AUSSCHLIESSLICH im folgenden JSON-Format ohne Markdown und ohne weitere Worte: " +
-                        "[{\"name\":\"Milch\",\"amount\":1.0,\"unit\":\"L\",\"category\":\"Milch & Eier\"}, " +
-                        "{\"name\":\"Eier\",\"amount\":6.0,\"unit\":\"Stück\",\"category\":\"Milch & Eier\"}, ...]. " +
-                        "Zulässige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'."
+                "Du bist ein intelligenter Küchenassistent. Analysiere das beigefügte Foto dieses Kühlschranks oder Küchentischs sorgfältig. " +
+                        "Erkenne AUSSCHLIESSLICH Lebensmittel und Zutaten, die auf dem Bild tatsächlich sichtbar sind. " +
+                        "Erfinde keine Zutaten dazu! Wenn auf dem Foto nur wenige oder keine Lebensmittel zu sehen sind, gib nur diese wenigen oder eine leere Liste zurück. " +
+                        "Nenne zu jeder Zutat den deutschen Namen, die geschätzte Menge, Einheit (g, kg, ml, L, Stück, Packung, Glas) und Kategorie. " +
+                        "Gültige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
+                        "Antworte AUSSCHLIESSLICH mit einem validen JSON-Array ohne Markdown-Codeblöcke und ohne zusätzliche Erklärungen:\n" +
+                        "[{\"name\":\"Milch\",\"amount\":1.0,\"unit\":\"L\",\"category\":\"Milch & Eier\"}]"
+
             ScanType.GROCERY_PURCHASE ->
-                "Du bist ein intelligenter Kassenbon- und Einkaufs-Scanner. Analysiere dieses Foto (Einkaufsbeleg, Kassenbon oder Lebensmittel-Einkauf auf dem Tisch). " +
-                        "Erkenne alle eingekauften Lebensmittel mit sinnvollen Mengen und Einheiten. " +
-                        "Antworte AUSSCHLIESSLICH im folgenden JSON-Format ohne Markdown und ohne weitere Worte: " +
-                        "[{\"name\":\"Nudeln\",\"amount\":500.0,\"unit\":\"g\",\"category\":\"Vorrat & Teigwaren\"}, " +
-                        "{\"name\":\"Tomaten\",\"amount\":4.0,\"unit\":\"Stück\",\"category\":\"Gemüse & Obst\"}, ...]. " +
-                        "Zulässige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'."
+                "Du bist ein Kassenbon- und Einkaufs-Scanner. Analysiere das beigefügte Foto (Einkaufszettel, Kassenbon oder Lebensmittel-Einkauf). " +
+                        "Erkenne alle eingekauften Lebensmittel, Speisen und Zutaten. Lies bei Kassenbons die Artikelzeilen und Mengenangaben genau ab. " +
+                        "Ignoriere Nicht-Lebensmittel wie Tüten, Pfand, Rabatte, Summenzeilen oder Drogerieartikel. " +
+                        "Nenne zu jeder Zutat den deutschen Namen, Menge, Einheit und Kategorie. " +
+                        "Gültige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
+                        "Antworte AUSSCHLIESSLICH mit einem validen JSON-Array ohne Markdown-Codeblöcke und ohne weitere Worte:\n" +
+                        "[{\"name\":\"Nudeln\",\"amount\":500.0,\"unit\":\"g\",\"category\":\"Vorrat & Teigwaren\"}]"
         }
     }
 
@@ -332,7 +381,6 @@ class AiVisionService(private val context: Context) {
     private fun parseJsonIngredients(rawOutput: String, scanType: ScanType): List<ScannedIngredient> {
         val result = mutableListOf<ScannedIngredient>()
         try {
-            // Strip any code block wrappers
             var clean = rawOutput.trim()
             if (clean.startsWith("```json")) {
                 clean = clean.removePrefix("```json")
@@ -344,7 +392,6 @@ class AiVisionService(private val context: Context) {
             }
             clean = clean.trim()
 
-            // Find JSON array start and end
             val startIdx = clean.indexOf('[')
             val endIdx = clean.lastIndexOf(']')
             if (startIdx != -1 && endIdx != -1 && endIdx > startIdx) {
@@ -378,14 +425,14 @@ class AiVisionService(private val context: Context) {
             Log.e("AiVisionService", "Error parsing LLM response: $rawOutput", e)
         }
 
-        return if (result.isNotEmpty()) result else generateSmartFallback(scanType, null).ingredients
+        return result
     }
 
     /**
-     * Smart built-in food recognizer that supplies realistic, diverse items
-     * when offline or using demo photos in the emulator.
+     * Smart built-in demo items for explicit "Beispiel testen" button in the emulator.
+     * Clearly labeled as interactive demo so user is never misled.
      */
-    fun generateSmartFallback(scanType: ScanType, note: String?): ScanResult {
+    fun generateDemoExample(scanType: ScanType): ScanResult {
         val items = when (scanType) {
             ScanType.FRIDGE -> listOf(
                 ScannedIngredient("Milch", 1.0, "L", "Milch & Eier"),
@@ -397,26 +444,24 @@ class AiVisionService(private val context: Context) {
                 ScannedIngredient("Gurke", 1.0, "Stück", "Gemüse & Obst"),
                 ScannedIngredient("Karotten", 3.0, "Stück", "Gemüse & Obst"),
                 ScannedIngredient("Hähnchenbrust", 400.0, "g", "Fleisch & Fisch"),
-                ScannedIngredient("Naturjoghurt", 500.0, "g", "Milch & Eier"),
-                ScannedIngredient("Senf", 1.0, "Glas", "Gewürze & Saucen")
+                ScannedIngredient("Naturjoghurt", 500.0, "g", "Milch & Eier")
             )
             ScanType.GROCERY_PURCHASE -> listOf(
-                ScannedIngredient("Nudeln", 500.0, "g", "Vorrat & Teigwaren"),
+                ScannedIngredient("Spaghetti", 500.0, "g", "Vorrat & Teigwaren"),
                 ScannedIngredient("Passierte Tomaten", 500.0, "ml", "Vorrat & Teigwaren"),
                 ScannedIngredient("Parmesan", 150.0, "g", "Milch & Eier"),
                 ScannedIngredient("Zwiebeln", 3.0, "Stück", "Gemüse & Obst"),
                 ScannedIngredient("Knoblauch", 1.0, "Knolle", "Gemüse & Obst"),
                 ScannedIngredient("Olivenöl", 500.0, "ml", "Gewürze & Saucen"),
                 ScannedIngredient("Mozzarella", 2.0, "Packung", "Milch & Eier"),
-                ScannedIngredient("Champignons", 250.0, "g", "Gemüse & Obst"),
-                ScannedIngredient("Basilikum", 1.0, "Bund", "Gemüse & Obst")
+                ScannedIngredient("Champignons", 250.0, "g", "Gemüse & Obst")
             )
         }
         return ScanResult(
             ingredients = items,
             scanType = scanType,
-            providerName = "Foto-Scan",
-            note = note
+            providerName = "Interaktives Beispiel (Demo)",
+            note = "Beispiel-Daten für Tests im Emulator"
         )
     }
 

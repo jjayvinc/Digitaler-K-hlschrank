@@ -242,16 +242,12 @@ fun AiScanDialog(
         isScanning = true
         errorMessage = null
         coroutineScope.launch {
-            try {
-                val res = aiService.scanImage(demoBitmap, scanType)
-                scanResult = res
-                scannedItems.clear()
-                scannedItems.addAll(res.ingredients)
-            } catch (e: Exception) {
-                errorMessage = "Beispiel-Scan fehlgeschlagen: ${e.localizedMessage ?: "Unbekannter Fehler"}"
-            } finally {
-                isScanning = false
-            }
+            kotlinx.coroutines.delay(1000)
+            val res = aiService.generateDemoExample(scanType)
+            scanResult = res
+            scannedItems.clear()
+            scannedItems.addAll(res.ingredients)
+            isScanning = false
         }
     }
 
@@ -304,6 +300,16 @@ fun AiScanDialog(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = { showProviderSettings = true },
+                        modifier = Modifier.testTag("scan_settings_button")
+                    ) {
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "KI-Einstellungen",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Default.Clear, contentDescription = "Schließen")
                     }
@@ -329,12 +335,26 @@ fun AiScanDialog(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text("⚠️", fontSize = 18.sp)
-                                Text(
-                                    text = errorText,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
-                                    modifier = Modifier.weight(1f)
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = errorText,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    if (errorText.contains("API-Schlüssel", ignoreCase = true) || errorText.contains("Einstellungen", ignoreCase = true)) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Button(
+                                            onClick = { showProviderSettings = true },
+                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.height(32.dp)
+                                        ) {
+                                            Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Einstellungen öffnen", style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
                                 IconButton(
                                     onClick = { errorMessage = null },
                                     modifier = Modifier.size(24.dp)
@@ -363,6 +383,39 @@ fun AiScanDialog(
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
+                            // Active Provider Indicator
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showProviderSettings = true }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(aiService.activeProvider.badge, fontSize = 14.sp)
+                                        Text(
+                                            text = "KI: ${aiService.activeProvider.displayName}",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                    Text(
+                                        text = "⚙️ Anpassen",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+
                             Text(
                                 text = if (scanType == ScanType.FRIDGE)
                                     "Mache ein Foto von deinem geöffneten Kühlschrank oder wähle ein Bild aus der Galerie."
@@ -501,24 +554,29 @@ fun AiScanDialog(
                             // Status badge
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
-                                color = Color.Black.copy(alpha = 0.75f),
+                                color = Color.Black.copy(alpha = 0.85f),
                                 modifier = Modifier.align(Alignment.Center)
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
                                     CircularProgressIndicator(
                                         color = MaterialTheme.colorScheme.primary,
-                                        strokeWidth = 2.dp,
-                                        modifier = Modifier.size(16.dp)
+                                        strokeWidth = 2.5.dp,
+                                        modifier = Modifier.size(22.dp)
                                     )
                                     Text(
-                                        text = "Zutaten werden erkannt...",
+                                        text = "🔍 KI analysiert dein Foto...",
                                         style = MaterialTheme.typography.labelMedium,
                                         color = Color.White,
                                         fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = aiService.activeProvider.displayName,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White.copy(alpha = 0.8f)
                                     )
                                 }
                             }

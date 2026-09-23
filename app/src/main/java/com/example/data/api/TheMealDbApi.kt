@@ -86,7 +86,23 @@ data class MealDbDto(
     @Json(name = "strMeasure20") val strMeasure20: String? = null
 )
 
+@JsonClass(generateAdapter = true)
+data class MealDbIngredientItem(
+    @Json(name = "idIngredient") val idIngredient: String?,
+    @Json(name = "strIngredient") val strIngredient: String?,
+    @Json(name = "strDescription") val strDescription: String? = null,
+    @Json(name = "strType") val strType: String? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class MealDbIngredientListResponse(
+    @Json(name = "meals") val meals: List<MealDbIngredientItem>?
+)
+
 interface TheMealDbApi {
+    @GET("api/json/v1/1/list.php?i=list")
+    suspend fun getAllIngredients(): MealDbIngredientListResponse
+
     @GET("api/json/v1/1/search.php")
     suspend fun searchMeals(@Query("s") query: String): MealDbResponse
 

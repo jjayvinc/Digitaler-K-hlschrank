@@ -12,6 +12,8 @@ import com.example.data.model.ShoppingItem
 import com.example.data.repository.CookResult
 import com.example.data.repository.FridgeRecipeRepository
 import com.example.data.repository.RecipeMatchResult
+import com.example.ui.components.IngredientCatalog
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -20,6 +22,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -59,6 +62,12 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
             if (replaceFridge && scanType == com.example.data.ai.ScanType.FRIDGE) {
                 repository.clearFridge()
             }
+            // Register any new scanned items into dynamic database catalog
+            IngredientCatalog.registerScannedIngredients(items, database.catalogDao())
+
+            // Publish to cloud Firestore so all users worldwide have them
+            com.example.data.cloud.FirestoreIngredientSync.publishIngredientsBatch(getApplication(), items)
+
             for (item in items) {
                 repository.addFridgeItem(
                     FridgeItem(
@@ -71,11 +80,43 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
             }
             closeScanDialog()
             val msg = if (scanType == com.example.data.ai.ScanType.FRIDGE) {
-                "✨ ${items.size} Zutat(en) automatisch dem Kühlschrank hinzugefügt!"
+                "✨ ${items.size} Zutat(en) dem Kühlschrank hinzugefügt & im Katalog gespeichert!"
             } else {
-                "🛒 ${items.size} Einkaufsartikel dem Kühlschrank hinzugerechnet!"
+                "🛒 ${items.size} Einkaufsartikel dem Kühlschrank hinzugerechnet & im Katalog gespeichert!"
             }
             _snackbarEvent.emit(msg)
+        }
+    }
+
+    fun registerCustomCatalogIngredient(
+        name: String,
+        category: String,
+        amount: Double = 1.0,
+        unit: String = "Stück"
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            IngredientCatalog.registerIngredient(
+                name = name,
+                category = category,
+                amount = amount,
+                unit = unit
+            )
+            val entity = com.example.data.model.CatalogIngredientEntity(
+                name = name.trim(),
+                emoji = IngredientCatalog.getEmojiFor(name),
+                category = category,
+                defaultAmount = amount,
+                unit = unit,
+                isCustom = true
+            )
+            database.catalogDao().insert(entity)
+            com.example.data.cloud.FirestoreIngredientSync.publishIngredient(
+                context = getApplication(),
+                name = name,
+                category = category,
+                amount = amount,
+                unit = unit
+            )
         }
     }
 
@@ -127,7 +168,7 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
             items.count { !it.isBought }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
 
-    // Filtered Fridge Items
+    // Filtered Fridge Items (computed on Default dispatcher for smooth UI)
     val filteredFridgeItems: StateFlow<List<FridgeItem>> = combine(
         fridgeItems,
         fridgeSearchQuery,
@@ -140,9 +181,10 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
             val matchesCategory = category == null || item.category.equals(category, ignoreCase = true)
             matchesQuery && matchesCategory
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }.flowOn(Dispatchers.Default)
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Filtered Recipes
+    // Filtered Recipes (computed on Default dispatcher for 60/120fps scrolling)
     val filteredRecipes: StateFlow<List<RecipeMatchResult>> = combine(
         recipeMatches,
         recipeSearchQuery,
@@ -166,7 +208,8 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
 
             matchesQuery && matchesFilter
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    }.flowOn(Dispatchers.Default)
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // Online database states (TheMealDB)
     private val _isSyncingOnline = MutableStateFlow(false)
@@ -176,11 +219,37 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
     val isSearchingOnline: StateFlow<Boolean> = _isSearchingOnline.asStateFlow()
 
     init {
-        viewModelScope.launch {
+        // Start real-time Firestore sync across all users
+        com.example.data.cloud.FirestoreIngredientSync.startRealtimeSync(
+            context = application,
+            catalogDao = database.catalogDao(),
+            coroutineScope = viewModelScope
+        )
+
+        viewModelScope.launch(Dispatchers.IO) {
+            // Load custom catalog items from database into memory
+            try {
+                val customEntities = database.catalogDao().getAllCatalogIngredients()
+                IngredientCatalog.loadCustomItemsFromEntities(customEntities)
+            } catch (e: Exception) {
+                android.util.Log.e("FridgeViewModel", "Failed to load custom catalog items", e)
+            }
+
+            // Translate existing MealDB recipes if needed
             repository.translateExistingMealDbRecipes()
+
+            // Synchronize the complete master ingredient list from TheMealDB (~600 ingredients)
+            try {
+                repository.syncAllTheMealDbIngredients()
+            } catch (e: Exception) {
+                android.util.Log.w("FridgeViewModel", "Failed to sync TheMealDB master ingredients", e)
+            }
+
+            // Only sync online recipes if database doesn't have sufficient recipes yet
+            if (repository.getRecipeCount() < 12) {
+                syncTheMealDb(silent = true)
+            }
         }
-        // Automatically sync initial rich recipes batch from TheMealDB on start
-        syncTheMealDb(silent = true)
     }
 
     fun syncTheMealDb(silent: Boolean = false) {
@@ -421,5 +490,10 @@ class FridgeViewModel(application: Application) : AndroidViewModel(application) 
             closeAddRecipeDialog()
             _snackbarEvent.emit("Eigenes Rezept „$title“ gespeichert!")
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        com.example.data.cloud.FirestoreIngredientSync.stopSync()
     }
 }
