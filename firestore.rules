@@ -4,5 +4,9 @@ service cloud.firestore {
     match /catalog_ingredients/{ingredientId} {
       allow read, write: if true;
     }
+    match /app_config/{configId} {
+      allow read: if true;
+      allow write: if false;
+    }
   }
 }

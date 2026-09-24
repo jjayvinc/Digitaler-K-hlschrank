@@ -179,9 +179,10 @@ fun AiProviderSettingsDialog(
                         OutlinedTextField(
                             value = geminiKey,
                             onValueChange = { geminiKey = it },
-                            label = { Text("Eigener Gemini API-Key (optional)") },
-                            placeholder = { Text("Standard-Schlüssel aktiv") },
-                            singleLine = true,
+                            label = { Text("Gemini API-Key(s) – Key-Rotation aktiv") },
+                            placeholder = { Text("AIzaSy..., AIzaSy...") },
+                            singleLine = false,
+                            maxLines = 3,
                             leadingIcon = { Icon(Icons.Default.Key, contentDescription = null) },
                             trailingIcon = {
                                 IconButton(onClick = { showGeminiKey = !showGeminiKey }) {
@@ -196,6 +197,32 @@ fun AiProviderSettingsDialog(
                                 .fillMaxWidth()
                                 .testTag("gemini_api_key_input")
                         )
+
+                        Text(
+                            text = "💡 Tipp: Du kannst mehrere Gratis-Keys mit Komma trennen. Die App schaltet automatisch zum nächsten Key, sobald einer das Limit (429) erreicht.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        val context = androidx.compose.ui.platform.LocalContext.current
+                        androidx.compose.material3.TextButton(
+                            onClick = {
+                                try {
+                                    val intent = android.content.Intent(
+                                        android.content.Intent.ACTION_VIEW,
+                                        android.net.Uri.parse("https://aistudio.google.com/app/apikey")
+                                    )
+                                    context.startActivity(intent)
+                                } catch (_: Exception) {}
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "🔑 Kostenlosen Gemini API-Key erstellen (Google AI Studio) ↗",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
                     }
                 }
 

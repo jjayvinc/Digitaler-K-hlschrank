@@ -2,14 +2,20 @@ package com.example.ui.components
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.Manifest
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.provider.MediaStore
+import android.util.Log
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
@@ -131,29 +137,73 @@ fun AiScanDialog(
         hasFeature || canResolve
     }
 
-    // Camera launcher
-    val cameraLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.TakePicturePreview()
-    ) { bitmap: Bitmap? ->
-        if (bitmap != null) {
-            selectedBitmap = bitmap
-            isScanning = true
-            errorMessage = null
-            coroutineScope.launch {
-                try {
-                    val res = aiService.scanImage(bitmap, scanType)
-                    scanResult = res
-                    scannedItems.clear()
-                    scannedItems.addAll(res.ingredients)
-                } catch (e: Exception) {
-                    errorMessage = "Erkennung fehlgeschlagen: ${e.localizedMessage ?: "Unbekannter Fehler"}"
-                } finally {
-                    isScanning = false
+    var cameraPhotoUri by remember { mutableStateOf<Uri?>(null) }
+
+    // Unified image processor: runs AI scan and provides clear feedback
+    fun processImage(bitmap: Bitmap) {
+        selectedBitmap = bitmap
+        isScanning = true
+        errorMessage = null
+        coroutineScope.launch {
+            try {
+                val res = aiService.scanImage(bitmap, scanType)
+                scanResult = res
+                scannedItems.clear()
+                scannedItems.addAll(res.ingredients)
+                if (res.ingredients.isEmpty()) {
+                    errorMessage = "Auf dem Foto wurden keine Zutaten eindeutig erkannt. Tipp: Öffne den Kühlschrank ganz, schalte gutes Licht an oder tippe unten auf 'Zutat aus Liste ergänzen' bzw. 'Beispiel testen'."
+                }
+            } catch (e: Exception) {
+                errorMessage = "Erkennung fehlgeschlagen: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+            } finally {
+                isScanning = false
+            }
+        }
+    }
+
+    // Full-resolution camera launcher (saves to FileProvider Uri)
+    val takePictureLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success: Boolean ->
+        if (success) {
+            val uri = cameraPhotoUri
+            if (uri != null) {
+                val bitmap = loadOptimizedOrientedBitmap(context, uri)
+                if (bitmap != null) {
+                    processImage(bitmap)
+                } else {
+                    errorMessage = "Das aufgenommene Foto konnte nicht geladen werden."
                 }
             }
         } else {
-            // User backed out or emulator camera produced no output
-            errorMessage = "Kein Foto aufgenommen. Auf dem Emulator kannst du gerne die Galerie oder das Beispiel verwenden."
+            errorMessage = "Kein Foto aufgenommen."
+        }
+    }
+
+    // Fallback thumbnail camera launcher
+    val takePicturePreviewLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicturePreview()
+    ) { bitmap: Bitmap? ->
+        if (bitmap != null) {
+            processImage(bitmap)
+        } else {
+            errorMessage = "Kein Foto aufgenommen."
+        }
+    }
+
+    // Helper to create a temp image file URI via FileProvider
+    fun createCameraUri(): Uri? {
+        return try {
+            val imagesFolder = File(context.cacheDir, "camera_images").apply { mkdirs() }
+            val photoFile = File(imagesFolder, "temp_scan_${System.currentTimeMillis()}.jpg")
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                photoFile
+            )
+        } catch (e: Exception) {
+            Log.e("AiScanDialog", "Error creating camera file URI", e)
+            null
         }
     }
 
@@ -161,13 +211,23 @@ fun AiScanDialog(
     fun tryLaunchCamera() {
         errorMessage = null
         try {
-            cameraLauncher.launch(null)
+            val uri = createCameraUri()
+            if (uri != null) {
+                cameraPhotoUri = uri
+                takePictureLauncher.launch(uri)
+            } else {
+                takePicturePreviewLauncher.launch(null)
+            }
         } catch (e: ActivityNotFoundException) {
-            errorMessage = "Keine Kamera-App gefunden. Auf diesem Emulator ist keine Kamera eingerichtet – bitte wähle ein Bild aus der Galerie oder probiere das Beispiel aus."
+            errorMessage = "Keine Kamera-App gefunden. Bitte wähle ein Bild aus der Galerie oder probiere das Beispiel aus."
         } catch (e: SecurityException) {
             errorMessage = "Kamerazugriff wurde vom System verweigert (${e.localizedMessage})."
         } catch (e: Exception) {
-            errorMessage = "Kamera konnte nicht gestartet werden: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+            try {
+                takePicturePreviewLauncher.launch(null)
+            } catch (_: Exception) {
+                errorMessage = "Kamera konnte nicht gestartet werden: ${e.localizedMessage ?: "Unbekannter Fehler"}"
+            }
         }
     }
 
@@ -201,31 +261,15 @@ fun AiScanDialog(
         }
     }
 
-    // Gallery launcher
+    // Gallery launcher with safe subsampling & EXIF orientation
     val galleryLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri: Uri? ->
         if (uri != null) {
             try {
-                val bitmap = context.contentResolver.openInputStream(uri)?.use {
-                    BitmapFactory.decodeStream(it)
-                }
+                val bitmap = loadOptimizedOrientedBitmap(context, uri)
                 if (bitmap != null) {
-                    selectedBitmap = bitmap
-                    isScanning = true
-                    errorMessage = null
-                    coroutineScope.launch {
-                        try {
-                            val res = aiService.scanImage(bitmap, scanType)
-                            scanResult = res
-                            scannedItems.clear()
-                            scannedItems.addAll(res.ingredients)
-                        } catch (e: Exception) {
-                            errorMessage = "Erkennung fehlgeschlagen: ${e.localizedMessage ?: "Unbekannter Fehler"}"
-                        } finally {
-                            isScanning = false
-                        }
-                    }
+                    processImage(bitmap)
                 } else {
                     errorMessage = "Bild konnte nicht dekodiert werden."
                 }
@@ -342,16 +386,31 @@ fun AiScanDialog(
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
                                     if (errorText.contains("API-Schlüssel", ignoreCase = true) || errorText.contains("Einstellungen", ignoreCase = true)) {
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Button(
-                                            onClick = { showProviderSettings = true },
-                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                                            shape = RoundedCornerShape(8.dp),
-                                            modifier = Modifier.height(32.dp)
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                                         ) {
-                                            Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(14.dp))
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Text("Einstellungen öffnen", style = MaterialTheme.typography.labelSmall)
+                                            Button(
+                                                onClick = { showProviderSettings = true },
+                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.height(34.dp)
+                                            ) {
+                                                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(14.dp))
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Key eintragen", style = MaterialTheme.typography.labelSmall)
+                                            }
+                                            OutlinedButton(
+                                                onClick = {
+                                                    errorMessage = null
+                                                    runDemoScan()
+                                                },
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.height(34.dp)
+                                            ) {
+                                                Text("✨ Demo testen", style = MaterialTheme.typography.labelSmall)
+                                            }
                                         }
                                     }
                                 }
@@ -818,7 +877,7 @@ fun AiScanDialog(
                     }
 
                     // Empty scan state: Photo was taken but no ingredients recognized
-                    if (!isScanning && scannedItems.isEmpty() && selectedBitmap != null) {
+                    if (!isScanning && errorMessage == null && scannedItems.isEmpty() && selectedBitmap != null) {
                         Surface(
                             shape = RoundedCornerShape(12.dp),
                             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
@@ -836,11 +895,36 @@ fun AiScanDialog(
                                     fontWeight = FontWeight.Bold
                                 )
                                 Text(
-                                    text = "Auf dem Foto konnten leider keine Lebensmittel erkannt werden. Wähle deine Zutaten einfach aus der Liste:",
+                                    text = "Auf diesem Foto konnten keine Lebensmittel erkannt werden.\nTipp: Sorge für helles Licht, halte die Kamera ruhig und öffne die Kühlschranktür ganz.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     textAlign = androidx.compose.ui.text.style.TextAlign.Center
                                 )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            selectedBitmap = null
+                                            onCameraClick()
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Wiederholen", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                    OutlinedButton(
+                                        onClick = { runDemoScan() },
+                                        modifier = Modifier.weight(1f),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("✨ Demo", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
                                 Button(
                                     onClick = { showDatabaseSearchDialog = true },
                                     modifier = Modifier
@@ -953,4 +1037,77 @@ private fun createDemoBitmap(scanType: ScanType): Bitmap {
     canvas.drawText(subtitle, width / 2f, height / 2f + 30f, paint)
 
     return bitmap
+}
+
+private fun loadOptimizedOrientedBitmap(context: Context, uri: Uri, maxDimension: Int = 1280): Bitmap? {
+    return try {
+        // 1. Decode bounds
+        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, boundsOptions)
+        }
+        val origWidth = boundsOptions.outWidth
+        val origHeight = boundsOptions.outHeight
+        if (origWidth <= 0 || origHeight <= 0) return null
+
+        // 2. Calculate subsampling
+        var inSampleSize = 1
+        while (origWidth / inSampleSize > maxDimension * 1.5 || origHeight / inSampleSize > maxDimension * 1.5) {
+            inSampleSize *= 2
+        }
+
+        // 3. Decode scaled bitmap
+        val decodeOptions = BitmapFactory.Options().apply {
+            this.inSampleSize = inSampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val decoded = context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, decodeOptions)
+        } ?: return null
+
+        // 4. Read EXIF Orientation
+        val orientation = try {
+            context.contentResolver.openInputStream(uri)?.use {
+                val exif = ExifInterface(it)
+                exif.getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        } catch (_: Throwable) {
+            ExifInterface.ORIENTATION_NORMAL
+        }
+
+        // 5. Rotate bitmap if needed so it is upright
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.postScale(1f, -1f)
+        }
+
+        val uprightBitmap = if (!matrix.isIdentity) {
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        } else {
+            decoded
+        }
+
+        // 6. Scale precisely to maxDimension
+        if (uprightBitmap.width > maxDimension || uprightBitmap.height > maxDimension) {
+            val ratio = minOf(maxDimension.toFloat() / uprightBitmap.width, maxDimension.toFloat() / uprightBitmap.height)
+            Bitmap.createScaledBitmap(
+                uprightBitmap,
+                (uprightBitmap.width * ratio).toInt(),
+                (uprightBitmap.height * ratio).toInt(),
+                true
+            )
+        } else {
+            uprightBitmap
+        }
+    } catch (e: Throwable) {
+        Log.e("AiScanDialog", "Error loading oriented bitmap from $uri", e)
+        null
+    }
 }

@@ -48,9 +48,9 @@ class AiVisionService(private val context: Context) {
     private val prefs = context.getSharedPreferences("ai_vision_settings", Context.MODE_PRIVATE)
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .build()
 
     var activeProvider: AiProvider
@@ -74,13 +74,51 @@ class AiVisionService(private val context: Context) {
         get() = prefs.getString("anthropic_api_key", "").orEmpty()
         set(value) = prefs.edit().putString("anthropic_api_key", value.trim()).apply()
 
-    /**
-     * Resolves the active Gemini API key from custom settings, BuildConfig secrets, or builtin env.
-     */
-    fun getEffectiveGeminiKey(): String? {
-        if (geminiCustomKey.isNotBlank()) {
-            return geminiCustomKey
+    // In-memory cache of cloud-synced keys from Firebase Firestore
+    private val cloudKeys = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+    init {
+        fetchCloudKeys()
+    }
+
+    private fun fetchCloudKeys() {
+        try {
+            val db = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+            db.collection("app_config").document("gemini")
+                .addSnapshotListener { snapshot, error ->
+                    if (error == null && snapshot != null && snapshot.exists()) {
+                        val keys = snapshot.get("active_keys") as? List<*>
+                        if (keys != null) {
+                            cloudKeys.clear()
+                            cloudKeys.addAll(keys.filterIsInstance<String>().map { it.trim() }.filter { it.isNotBlank() })
+                        }
+                    }
+                }
+        } catch (_: Throwable) {
+            // Optional fallback
         }
+    }
+
+    /**
+     * Resolves the list of candidate Gemini API keys.
+     * Supports multiple keys separated by commas, semicolons, or newlines,
+     * as well as cloud-synced keys from Firebase Firestore.
+     */
+    fun getGeminiKeyPool(): List<String> {
+        val pool = mutableListOf<String>()
+
+        // 1. User custom keys (supports comma/newline-separated list of keys)
+        if (geminiCustomKey.isNotBlank()) {
+            val customKeys = geminiCustomKey.split(",", ";", "\n")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+            pool.addAll(customKeys)
+        }
+
+        // 2. Cloud keys fetched from Firebase Firestore
+        pool.addAll(cloudKeys)
+
+        // 3. Secrets / BuildConfig key
         val buildConfigKey = try {
             val field = BuildConfig::class.java.getField("GEMINI_API_KEY")
             field.get(null) as? String
@@ -88,8 +126,13 @@ class AiVisionService(private val context: Context) {
             null
         }
         if (!buildConfigKey.isNullOrBlank() && buildConfigKey != "MY_GEMINI_API_KEY") {
-            return buildConfigKey
+            val keys = buildConfigKey.split(",", ";", "\n")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+            pool.addAll(keys)
         }
+
+        // 4. Built-in environment key
         val builtinKey = try {
             val field = BuildConfig::class.java.getField("BUILTIN_GEMINI_KEY")
             field.get(null) as? String
@@ -97,9 +140,20 @@ class AiVisionService(private val context: Context) {
             null
         }
         if (!builtinKey.isNullOrBlank() && builtinKey != "MY_GEMINI_API_KEY") {
-            return builtinKey
+            val keys = builtinKey.split(",", ";", "\n")
+                .map { it.trim() }
+                .filter { it.isNotBlank() && it != "MY_GEMINI_API_KEY" }
+            pool.addAll(keys)
         }
-        return null
+
+        return pool.distinct()
+    }
+
+    /**
+     * Resolves the active Gemini API key from the pool.
+     */
+    fun getEffectiveGeminiKey(): String? {
+        return getGeminiKeyPool().firstOrNull()
     }
 
     /**
@@ -115,13 +169,13 @@ class AiVisionService(private val context: Context) {
 
         when (provider) {
             AiProvider.GEMINI -> {
-                val key = getEffectiveGeminiKey()
-                if (key.isNullOrBlank()) {
+                val pool = getGeminiKeyPool()
+                if (pool.isEmpty()) {
                     throw IllegalStateException(
                         "Kein Gemini API-Schlüssel gefunden. Bitte stelle sicher, dass der API-Schlüssel in der Build-Umgebung konfiguriert ist oder trage deinen Key in den ⚙️ Einstellungen ein."
                     )
                 }
-                scanWithGemini(base64Image, scanType, key)
+                scanWithGemini(base64Image, scanType, pool)
             }
             AiProvider.OPENAI -> {
                 if (openAiKey.isBlank()) {
@@ -143,13 +197,14 @@ class AiVisionService(private val context: Context) {
     }
 
     /**
-     * Real Google Gemini Vision API call with model fallback:
-     * Tries gemini-3.6-flash first, falls back to gemini-3.5-flash or gemini-flash-latest.
+     * Real Google Gemini Vision API call with automatic key rotation and model fallback:
+     * Fast response with thinkingBudget: 0 to eliminate 30+ second reasoning delays and timeouts.
+     * Guaranteed valid JSON array via responseMimeType: "application/json".
      */
     private suspend fun scanWithGemini(
         base64Image: String,
         scanType: ScanType,
-        apiKey: String
+        keyPool: List<String>
     ): ScanResult {
         val prompt = buildPrompt(scanType)
         val geminiPayload = JSONObject().apply {
@@ -170,62 +225,106 @@ class AiVisionService(private val context: Context) {
             }
             put("contents", contents)
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.1)
-                put("maxOutputTokens", 1200)
+                put("responseMimeType", "application/json")
+                put("temperature", 0.2)
+                put("maxOutputTokens", 2048)
+                put("thinkingConfig", JSONObject().apply {
+                    put("thinkingBudget", 0)
+                })
             })
         }
 
-        val modelsToTry = listOf("gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest")
+        val modelsToTry = listOf("gemini-3.6-flash", "gemini-3.8-flash", "gemini-flash-latest")
         var lastError: String? = null
         var lastStatusCode = 0
+        var hadTimeout = false
 
-        for (model in modelsToTry) {
-            val request = Request.Builder()
-                .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
-                .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
-                .build()
+        // Iterate through all candidate keys in the pool (automatic key rotation)
+        for ((keyIndex, currentApiKey) in keyPool.withIndex()) {
+            for (model in modelsToTry) {
+                val request = Request.Builder()
+                    .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$currentApiKey")
+                    .post(geminiPayload.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
 
-            val response = httpClient.newCall(request).execute()
-            val responseBody = response.body?.string().orEmpty()
+                try {
+                    val response = httpClient.newCall(request).execute()
+                    val responseBody = response.body?.string().orEmpty()
 
-            if (response.isSuccessful) {
-                val json = JSONObject(responseBody)
-                val candidates = json.optJSONArray("candidates")
-                if (candidates != null && candidates.length() > 0) {
-                    val text = candidates.getJSONObject(0)
-                        .getJSONObject("content")
-                        .getJSONArray("parts")
-                        .getJSONObject(0)
-                        .getString("text")
+                    if (response.isSuccessful) {
+                        val json = JSONObject(responseBody)
+                        val candidates = json.optJSONArray("candidates")
+                        if (candidates != null && candidates.length() > 0) {
+                            val candidate = candidates.getJSONObject(0)
+                            val parts = candidate.getJSONObject("content").getJSONArray("parts")
+                            var text: String? = null
+                            for (p in 0 until parts.length()) {
+                                val partObj = parts.getJSONObject(p)
+                                if (partObj.has("text")) {
+                                    text = partObj.getString("text")
+                                    break
+                                }
+                            }
 
-                    val items = parseJsonIngredients(text, scanType)
-                    return ScanResult(
-                        ingredients = items,
-                        scanType = scanType,
-                        providerName = "Google Gemini ($model)"
-                    )
-                }
-            } else {
-                lastStatusCode = response.code
-                val errorDetail = try {
-                    val errJson = JSONObject(responseBody)
-                    errJson.optJSONObject("error")?.optString("message") ?: responseBody
-                } catch (_: Exception) {
-                    responseBody
-                }
-                lastError = errorDetail
-                // If 404 (model not found) or 503, try next fallback model
-                if (response.code != 404 && response.code != 503) {
-                    break
+                            if (!text.isNullOrBlank()) {
+                                val items = parseJsonIngredients(text, scanType)
+                                val providerTag = if (keyPool.size > 1) {
+                                    "Google Gemini ($model, Key #${keyIndex + 1})"
+                                } else {
+                                    "Google Gemini ($model)"
+                                }
+                                return ScanResult(
+                                    ingredients = items,
+                                    scanType = scanType,
+                                    providerName = providerTag
+                                )
+                            }
+                        }
+                    } else {
+                        lastStatusCode = response.code
+                        val errorDetail = try {
+                            val errJson = JSONObject(responseBody)
+                            errJson.optJSONObject("error")?.optString("message") ?: responseBody
+                        } catch (_: Exception) {
+                            responseBody
+                        }
+                        lastError = errorDetail
+
+                        // If Rate Limited (429) or Forbidden (403/401), rotate to the next key in the pool!
+                        if (response.code == 429 || response.code == 401 || response.code == 403) {
+                            break
+                        }
+
+                        // If 404 (model not found) or 503, try next fallback model for same key
+                        if (response.code != 404 && response.code != 503) {
+                            break
+                        }
+                    }
+                } catch (timeoutEx: java.net.SocketTimeoutException) {
+                    hadTimeout = true
+                    lastError = "Zeitüberschreitung beim Serveraufruf"
+                    // Try next model or next key
+                    continue
+                } catch (ioEx: java.io.IOException) {
+                    lastError = "Netzwerkfehler: ${ioEx.localizedMessage}"
+                    continue
                 }
             }
         }
 
-        val friendlyMessage = when (lastStatusCode) {
-            429 -> "Das Anfrage-Limit des KI-Servers ist momentan erreicht. Bitte warte eine Minute oder trage in den ⚙️ Einstellungen deinen eigenen kostenlosen Gemini-Key ein."
-            401, 403 -> "API-Zugriff verweigert ($lastStatusCode). Bitte prüfe deinen Schlüssel in den ⚙️ Einstellungen oder klicke auf 'Standard nutzen'."
-            404 -> "Das KI-Modell ist temporär nicht erreichbar (404). Bitte versuche es in wenigen Augenblicken erneut."
-            else -> "Gemini API Fehler ($lastStatusCode): ${lastError ?: "Unbekannter Fehler"}"
+        val friendlyMessage = when {
+            hadTimeout && lastStatusCode == 0 ->
+                "Zeitüberschreitung (Timeout): Die KI-Analyse hat zu lange gedauert. Bitte prüfe deine Internetverbindung oder versuche es erneut."
+            lastStatusCode == 429 ->
+                "Alle verfügbaren API-Schlüssel haben das Limit erreicht (429). Bitte warte eine Minute oder trage weitere Schlüssel in den ⚙️ Einstellungen ein."
+            lastStatusCode == 401 || lastStatusCode == 403 ->
+                "API-Zugriff verweigert ($lastStatusCode). Bitte prüfe die hinterlegten Schlüssel in den ⚙️ Einstellungen."
+            lastStatusCode == 503 ->
+                "Die Gemini-Server sind aktuell stark ausgelastet (503). Bitte versuche es in wenigen Momenten erneut."
+            lastStatusCode == 404 ->
+                "Das KI-Modell ist temporär nicht erreichbar (404). Bitte versuche es in wenigen Augenblicken erneut."
+            else ->
+                "Gemini API Fehler ($lastStatusCode): ${lastError ?: "Unbekannter Fehler"}"
         }
         throw IllegalStateException(friendlyMessage)
     }
@@ -379,27 +478,40 @@ class AiVisionService(private val context: Context) {
     private fun buildPrompt(scanType: ScanType): String {
         return when (scanType) {
             ScanType.FRIDGE ->
-                "Du bist ein intelligenter Küchenassistent. Analysiere das beigefügte Foto dieses Kühlschranks oder Küchentischs sorgfältig. " +
-                        "Erkenne AUSSCHLIESSLICH Lebensmittel und Zutaten, die auf dem Bild tatsächlich sichtbar sind. " +
-                        "Erfinde keine Zutaten dazu! Wenn auf dem Foto nur wenige oder keine Lebensmittel zu sehen sind, gib nur diese wenigen oder eine leere Liste zurück. " +
-                        "Nenne zu jeder Zutat den deutschen Namen, die geschätzte Menge, Einheit (g, kg, ml, L, Stück, Packung, Glas) und Kategorie. " +
-                        "Gültige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
-                        "Antworte AUSSCHLIESSLICH mit einem validen JSON-Array ohne Markdown-Codeblöcke und ohne zusätzliche Erklärungen:\n" +
-                        "[{\"name\":\"Milch\",\"amount\":1.0,\"unit\":\"L\",\"category\":\"Milch & Eier\"}]"
+                "Du bist ein intelligenter Küchen- und Lebensmittel-Scanner. " +
+                        "Analysiere das beigefügte Foto dieses Kühlschranks, Gefrierfachs oder der Speisekammer aufmerksam. " +
+                        "Erkenne alle sichtbaren Lebensmittel, Zutaten, Packungen, Flaschen, Gläser, Dosen, Obst, Gemüse, Milchprodukte, Soßen, Fleisch, Käse etc. " +
+                        "Sei gründlich und erfasse auch Produkte in Türablagen, Fächern und hinteren Reihen. " +
+                        "Gib zu jeder Zutat einen verständlichen deutschen Namen, eine realistische Menge, eine passende Einheit (Stück, Packung, Glas, Flasche, g, kg, ml, L) " +
+                        "und eine der folgenden Kategorien an: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
+                        "Antworte AUSSCHLIESSLICH als valides JSON-Array im Format: " +
+                        "[{\"name\":\"Vollmilch\",\"amount\":1.0,\"unit\":\"L\",\"category\":\"Milch & Eier\"}]"
 
             ScanType.GROCERY_PURCHASE ->
-                "Du bist ein Kassenbon- und Einkaufs-Scanner. Analysiere das beigefügte Foto (Einkaufszettel, Kassenbon oder Lebensmittel-Einkauf). " +
-                        "Erkenne alle eingekauften Lebensmittel, Speisen und Zutaten. Lies bei Kassenbons die Artikelzeilen und Mengenangaben genau ab. " +
-                        "Ignoriere Nicht-Lebensmittel wie Tüten, Pfand, Rabatte, Summenzeilen oder Drogerieartikel. " +
-                        "Nenne zu jeder Zutat den deutschen Namen, Menge, Einheit und Kategorie. " +
-                        "Gültige Kategorien: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
-                        "Antworte AUSSCHLIESSLICH mit einem validen JSON-Array ohne Markdown-Codeblöcke und ohne weitere Worte:\n" +
-                        "[{\"name\":\"Nudeln\",\"amount\":500.0,\"unit\":\"g\",\"category\":\"Vorrat & Teigwaren\"}]"
+                "Du bist ein intelligenter Kassenbon- und Einkaufs-Scanner. " +
+                        "Analysiere das beigefügte Foto (Kassenbon, Quittung oder Lebensmitteleinkauf). " +
+                        "Erfasse alle gekauften Lebensmittel, Speisen, Getränke und Kochzutaten mit Menge und Einheit. " +
+                        "Ignoriere Nicht-Lebensmittel (wie Pfand, Plastiktüten, Tabakwaren, Reinigungsmittel, Drogerieartikel). " +
+                        "Ordne jede Zutat einer Kategorie zu: 'Gemüse & Obst', 'Milch & Eier', 'Fleisch & Fisch', 'Vorrat & Teigwaren', 'Gewürze & Saucen', 'Sonstiges'. " +
+                        "Antworte AUSSCHLIESSLICH als valides JSON-Array im Format: " +
+                        "[{\"name\":\"Spaghetti\",\"amount\":500.0,\"unit\":\"g\",\"category\":\"Vorrat & Teigwaren\"}]"
+        }
+    }
+
+    private fun mapToAppCategory(rawCat: String, ingredientName: String): String {
+        val lower = rawCat.lowercase()
+        return when {
+            lower.contains("gemüse") || lower.contains("obst") || lower.contains("frucht") || lower.contains("salat") || lower.contains("beere") -> "Gemüse & Obst"
+            lower.contains("milch") || lower.contains("käse") || lower.contains("joghurt") || lower.contains("butter") || lower.contains("ei") || lower.contains("quark") || lower.contains("sahne") -> "Milch & Eier"
+            lower.contains("fleisch") || lower.contains("wurst") || lower.contains("fisch") || lower.contains("schinken") || lower.contains("hähnchen") || lower.contains("rind") || lower.contains("geflügel") || lower.contains("lachs") -> "Fleisch & Fisch"
+            lower.contains("vorrat") || lower.contains("teig") || lower.contains("nudel") || lower.contains("pasta") || lower.contains("reis") || lower.contains("mehl") || lower.contains("brot") || lower.contains("müsli") || lower.contains("hafer") -> "Vorrat & Teigwaren"
+            lower.contains("gewürz") || lower.contains("sauce") || lower.contains("soße") || lower.contains("öl") || lower.contains("essig") || lower.contains("senf") || lower.contains("ketchup") || lower.contains("dip") || lower.contains("dressing") -> "Gewürze & Saucen"
+            else -> FridgeRecipeRepository.getCategoryForIngredient(ingredientName)
         }
     }
 
     /**
-     * Robust parser for LLM json output
+     * Robust parser for LLM json output (supports root arrays, wrapper objects, and markdown blocks)
      */
     private fun parseJsonIngredients(rawOutput: String, scanType: ScanType): List<ScannedIngredient> {
         val result = mutableListOf<ScannedIngredient>()
@@ -415,30 +527,45 @@ class AiVisionService(private val context: Context) {
             }
             clean = clean.trim()
 
-            val startIdx = clean.indexOf('[')
-            val endIdx = clean.lastIndexOf(']')
-            if (startIdx != -1 && endIdx != -1 && endIdx > startIdx) {
-                clean = clean.substring(startIdx, endIdx + 1)
+            // Handle root JSON Array or root JSON Object with an items/ingredients array
+            val array = try {
+                val startIdx = clean.indexOf('[')
+                val endIdx = clean.lastIndexOf(']')
+                if (startIdx != -1 && endIdx != -1 && endIdx > startIdx) {
+                    JSONArray(clean.substring(startIdx, endIdx + 1))
+                } else {
+                    val rootObj = JSONObject(clean)
+                    rootObj.optJSONArray("ingredients")
+                        ?: rootObj.optJSONArray("items")
+                        ?: rootObj.optJSONArray("lebensmittel")
+                        ?: rootObj.optJSONArray("products")
+                        ?: JSONArray().apply { put(rootObj) }
+                }
+            } catch (_: Exception) {
+                JSONArray()
             }
 
-            val array = JSONArray(clean)
             for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
+                val obj = array.optJSONObject(i) ?: continue
                 val rawName = obj.optString("name", "").trim()
                 if (rawName.isBlank()) continue
 
-                val amount = obj.optDouble("amount", 1.0)
-                val unit = obj.optString("unit", "Stück").trim()
-                var category = obj.optString("category", "").trim()
-                if (category.isBlank() || category == "null") {
-                    category = FridgeRecipeRepository.getCategoryForIngredient(rawName)
+                val rawAmount = obj.opt("amount")
+                val amount = when (rawAmount) {
+                    is Number -> rawAmount.toDouble()
+                    is String -> rawAmount.replace(",", ".").filter { it.isDigit() || it == '.' }.toDoubleOrNull() ?: 1.0
+                    else -> 1.0
                 }
+
+                val unit = obj.optString("unit", "Stück").trim().ifBlank { "Stück" }
+                val rawCategory = obj.optString("category", "").trim()
+                val category = mapToAppCategory(rawCategory, rawName)
 
                 result.add(
                     ScannedIngredient(
                         name = rawName.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() },
-                        amount = if (amount <= 0) 1.0 else amount,
-                        unit = if (unit.isBlank()) "Stück" else unit,
+                        amount = if (amount <= 0.0) 1.0 else amount,
+                        unit = unit,
                         category = category,
                         isSelected = true
                     )
@@ -489,7 +616,7 @@ class AiVisionService(private val context: Context) {
     }
 
     private fun bitmapToBase64(bitmap: Bitmap): String {
-        val maxDimension = 1024
+        val maxDimension = 1200
         val scaled = if (bitmap.width > maxDimension || bitmap.height > maxDimension) {
             val ratio = minOf(maxDimension.toFloat() / bitmap.width, maxDimension.toFloat() / bitmap.height)
             Bitmap.createScaledBitmap(bitmap, (bitmap.width * ratio).toInt(), (bitmap.height * ratio).toInt(), true)
